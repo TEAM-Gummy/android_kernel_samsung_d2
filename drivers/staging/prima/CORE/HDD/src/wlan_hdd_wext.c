@@ -157,7 +157,6 @@ static const hdd_freq_chan_map_t freq_chan_map[] = { {2412, 1}, {2417, 2},
 #define WE_SET_HIGHER_DTIM_TRANSITION   8
 #define WE_SET_TM_LEVEL      9
 #define WE_ENABLE_STRICT_FCC_REG  10
-#define WE_MTRACE_SELECTIVE_MODULE_LOG_ENABLE_CMD    13
 
 /* Private ioctls and their sub-ioctls */
 #define WLAN_PRIV_SET_NONE_GET_INT    (SIOCIWFIRSTPRIV + 1)
@@ -214,7 +213,6 @@ static const hdd_freq_chan_map_t freq_chan_map[] = { {2412, 1}, {2417, 2},
 #define WE_ENABLE_DXE_STALL_DETECT 6
 #define WE_DISPLAY_DXE_SNAP_SHOT   7
 #define WE_DISPLAY_DATAPATH_SNAP_SHOT    9
-#define WE_SET_REASSOC_TRIGGER     8
 
 /* Private ioctls and their sub-ioctls */
 #define WLAN_PRIV_SET_VAR_INT_GET_NONE   (SIOCIWFIRSTPRIV + 7)
@@ -230,6 +228,7 @@ static const hdd_freq_chan_map_t freq_chan_map[] = { {2412, 1}, {2417, 2},
 #endif
 
 #define WE_MTRACE_DUMP_CMD    8
+#define WE_MTRACE_SELECTIVE_MODULE_LOG_ENABLE_CMD    9
 
 #ifdef FEATURE_WLAN_TDLS
 #undef  MAX_VAR_ARGS
@@ -2619,6 +2618,12 @@ VOS_STATUS  wlan_hdd_enter_bmps(hdd_adapter_t *pAdapter, int mode)
 
    hddLog(VOS_TRACE_LEVEL_INFO_HIGH, "power mode=%d", mode);
    pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+   if (pHddCtx->isLogpInProgress) {
+      VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                "%s:LOGP in Progress. Ignore!!!", __func__);
+      return VOS_STATUS_E_FAILURE;
+   }
+
    init_completion(&context.completion);
 
    context.pAdapter = pAdapter;
@@ -4059,15 +4064,6 @@ static int iw_setint_getnone(struct net_device *dev, struct iw_request_info *inf
            break;
         }
 
-        case WE_MTRACE_SELECTIVE_MODULE_LOG_ENABLE_CMD:
-        {
-           hddLog(LOG1, "%s: SELECTIVE_MODULE_LOG %d arg1",
-                  __func__, set_value);
-           vosTraceEnable(set_value);
-
-           break;
-        }
-
         case WE_ENABLE_STRICT_FCC_REG:
         {
            hdd_context_t *hddCtxt = WLAN_HDD_GET_CTX(pAdapter);
@@ -4727,17 +4723,6 @@ static int iw_setnone_getnone(struct net_device *dev, struct iw_request_info *in
             WLANTL_TLDebugMessage(VOS_TRUE);
             break;
         }
-        case  WE_SET_REASSOC_TRIGGER:
-        {
-            hdd_adapter_t *pAdapter = WLAN_HDD_GET_PRIV_PTR(dev);
-            tpAniSirGlobal pMac = WLAN_HDD_GET_HAL_CTX(pAdapter);
-            v_U32_t roamId = 0;
-            tCsrRoamModifyProfileFields modProfileFields;
-            sme_GetModifyProfileFields(pMac, pAdapter->sessionId, &modProfileFields);
-            sme_RoamReassoc(pMac, pAdapter->sessionId, NULL, modProfileFields, &roamId, 1);
-            return 0;
-        }
-        
 
         default:
         {
@@ -4846,12 +4831,14 @@ int iw_set_var_ints_getnone(struct net_device *dev, struct iw_request_info *info
     {
         case WE_LOG_DUMP_CMD:
             {
+                vos_ssr_protect(__func__);
                 hddLog(LOG1, "%s: LOG_DUMP %d arg1 %d arg2 %d arg3 %d arg4 %d",
                         __func__, apps_args[0], apps_args[1], apps_args[2],
                         apps_args[3], apps_args[4]);
 
                 logPrintf(hHal, apps_args[0], apps_args[1], apps_args[2],
                         apps_args[3], apps_args[4]);
+                vos_ssr_unprotect(__func__);
 
             }
             break;
@@ -4875,6 +4862,14 @@ int iw_set_var_ints_getnone(struct net_device *dev, struct iw_request_info *info
 
                 hdd_setP2pPs(dev, &p2pNoA);
 
+            }
+            break;
+
+        case WE_MTRACE_SELECTIVE_MODULE_LOG_ENABLE_CMD:
+            {
+                hddLog(LOG1, "%s: SELECTIVE_MODULE_LOG %d arg1 %d arg2",
+                        __func__, apps_args[0], apps_args[1]);
+                vosTraceEnable(apps_args[0], apps_args[1]);
             }
             break;
 
@@ -7219,11 +7214,6 @@ static const struct iw_priv_args we_private_args[] = {
         0,
         "setStrictFCCreg" },
 
-    {   WE_MTRACE_SELECTIVE_MODULE_LOG_ENABLE_CMD,
-        IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,
-        0,
-        "setdumplog" },
-
     /* handlers for main ioctl */
     {   WLAN_PRIV_SET_NONE_GET_INT,
         0,
@@ -7418,11 +7408,6 @@ static const struct iw_priv_args we_private_args[] = {
         0,
         0,
         "dataSnapshot"},
-    {
-        WE_SET_REASSOC_TRIGGER,
-        0,
-        0,
-        "reassoc" },
 
     /* handlers for main ioctl */
     {   WLAN_PRIV_SET_VAR_INT_GET_NONE,
@@ -7437,6 +7422,11 @@ static const struct iw_priv_args we_private_args[] = {
         "dump" },
 
     /* handlers for sub-ioctl */
+    {   WE_MTRACE_SELECTIVE_MODULE_LOG_ENABLE_CMD,
+        IW_PRIV_TYPE_INT | MAX_VAR_ARGS,
+        0,
+        "setdumplog" },
+
     {   WE_MTRACE_DUMP_CMD,
         IW_PRIV_TYPE_INT | MAX_VAR_ARGS,
         0,

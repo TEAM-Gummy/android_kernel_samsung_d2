@@ -2,7 +2,7 @@
  *
  * MSM MDP Interface (used by framebuffer core)
  *
- * Copyright (c) 2007-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2007-2014, The Linux Foundation. All rights reserved.
  * Copyright (C) 2007 Google Incorporated
  *
  * This software is licensed under the terms of the GNU General Public
@@ -3194,6 +3194,15 @@ static int mdp_probe(struct platform_device *pdev)
 			mfd->dma = &dma2_data;
 			mdp4_display_intf_sel(PRIMARY_INTF_SEL, LCDC_RGB_INTF);
 		}
+		/*
+		 * There is just a single underrun when lcdc timing
+		 * generator is enabled for no obvious reasons.  As a
+		 * workaround the underrun color is disabled here, so
+		 * that the single underrun won't have any visual
+		 * effect. Later, when the underrun is recoved, the
+		 * underrun color is restored.
+		 */
+		MDP_OUTP(MDP_BASE + 0xc002c, 0x80000000);
 #else
 		mfd->dma = &dma2_data;
 		mfd->vsync_ctrl = mdp_dma_lcdc_vsync_ctrl;
@@ -3242,6 +3251,8 @@ static int mdp_probe(struct platform_device *pdev)
 			pdata->off = mdp4_overlay_writeback_off;
 			mfd->dma_fnc = mdp4_writeback_overlay;
 			mfd->dma = &dma_wb_data;
+			mutex_init(&mfd->writeback_mutex);
+			mutex_init(&mfd->unregister_mutex);
 			mdp4_display_intf_sel(EXTERNAL_INTF_SEL, DTV_INTF);
 		}
 		break;
