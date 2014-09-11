@@ -823,22 +823,26 @@ int truncate_xattr_node(struct inode *inode, struct page *page)
  */
 void remove_inode_page(struct inode *inode)
 {
-	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
-	struct page *page;
-	nid_t ino = inode->i_ino;
 	struct dnode_of_data dn;
 
-	page = get_node_page(sbi, ino);
-	if (IS_ERR(page))
+	set_new_dnode(&dn, inode, NULL, NULL, inode->i_ino);
+	if (get_dnode_of_data(&dn, 0, LOOKUP_NODE))
 		return;
 
-	if (truncate_xattr_node(inode, page)) {
-		f2fs_put_page(page, 1);
+	if (truncate_xattr_node(inode, dn.inode_page)) {
+		f2fs_put_dnode(&dn);
 		return;
 	}
-	/* 0 is possible, after f2fs_new_inode() is failed */
+
+	/* remove potential inline_data blocks */
+	if (S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode) ||
+				S_ISLNK(inode->i_mode))
+		truncate_data_blocks_range(&dn, 1);
+
+	/* 0 is possible, after f2fs_new_inode() has failed */
 	f2fs_bug_on(inode->i_blocks != 0 && inode->i_blocks != 1);
-	set_new_dnode(&dn, inode, page, page, ino);
+
+	/* will put inode & node pages */
 	truncate_node(&dn);
 }
 
@@ -1129,8 +1133,11 @@ continue_unlock:
 				set_fsync_mark(page, 0);
 				set_dentry_mark(page, 0);
 			}
-			NODE_MAPPING(sbi)->a_ops->writepage(page, wbc);
-			wrote++;
+
+			if (NODE_MAPPING(sbi)->a_ops->writepage(page, wbc))
+				unlock_page(page);
+			else
+				wrote++;
 
 			if (--wbc->nr_to_write == 0)
 				break;
@@ -1211,6 +1218,8 @@ static int f2fs_write_node_page(struct page *page,
 	trace_f2fs_writepage(page, NODE);
 
 	if (unlikely(sbi->por_doing))
+		goto redirty_out;
+	if (unlikely(f2fs_cp_error(sbi)))
 		goto redirty_out;
 
 	f2fs_wait_on_page_writeback(page, NODE);
@@ -1539,15 +1548,6 @@ void alloc_nid_failed(struct f2fs_sb_info *sbi, nid_t nid)
 		kmem_cache_free(free_nid_slab, i);
 }
 
-void recover_node_page(struct f2fs_sb_info *sbi, struct page *page,
-		struct f2fs_summary *sum, struct node_info *ni,
-		block_t new_blkaddr)
-{
-	rewrite_node_page(sbi, page, sum, ni->blk_addr, new_blkaddr);
-	set_node_addr(sbi, ni, new_blkaddr, false);
-	clear_node_page_dirty(page);
-}
-
 void recover_inline_xattr(struct inode *inode, struct page *page)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
@@ -1556,18 +1556,14 @@ void recover_inline_xattr(struct inode *inode, struct page *page)
 	struct page *ipage;
 	struct f2fs_inode *ri;
 
-	if (!f2fs_has_inline_xattr(inode))
-		return;
-
-	if (!IS_INODE(page))
-		return;
-
-	ri = F2FS_INODE(page);
-	if (!(ri->i_inline & F2FS_INLINE_XATTR))
-		return;
-
 	ipage = get_node_page(sbi, inode->i_ino);
 	f2fs_bug_on(IS_ERR(ipage));
+
+	ri = F2FS_INODE(page);
+	if (!(ri->i_inline & F2FS_INLINE_XATTR)) {
+		clear_inode_flag(F2FS_I(inode), FI_INLINE_XATTR);
+		goto update_inode;
+	}
 
 	dst_addr = inline_xattr_addr(ipage);
 	src_addr = inline_xattr_addr(page);
@@ -1575,20 +1571,17 @@ void recover_inline_xattr(struct inode *inode, struct page *page)
 
 	f2fs_wait_on_page_writeback(ipage, NODE);
 	memcpy(dst_addr, src_addr, inline_size);
-
+update_inode:
 	update_inode(inode, ipage);
 	f2fs_put_page(ipage, 1);
 }
 
-bool recover_xattr_data(struct inode *inode, struct page *page, block_t blkaddr)
+void recover_xattr_data(struct inode *inode, struct page *page, block_t blkaddr)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
 	nid_t prev_xnid = F2FS_I(inode)->i_xattr_nid;
 	nid_t new_xnid = nid_of_node(page);
 	struct node_info ni;
-
-	if (!f2fs_has_xattr_block(ofs_of_node(page)))
-		return false;
 
 	/* 1: invalidate the previous xattr nid */
 	if (!prev_xnid)
@@ -1617,7 +1610,6 @@ recover_xnid:
 	set_node_addr(sbi, &ni, blkaddr, false);
 
 	update_inode_page(inode);
-	return true;
 }
 
 int recover_inode_page(struct f2fs_sb_info *sbi, struct page *page)
@@ -1650,6 +1642,7 @@ int recover_inode_page(struct f2fs_sb_info *sbi, struct page *page)
 	dst->i_blocks = cpu_to_le64(1);
 	dst->i_links = cpu_to_le32(1);
 	dst->i_xattr_nid = 0;
+	dst->i_inline = src->i_inline & F2FS_INLINE_XATTR;
 
 	new_ni = old_ni;
 	new_ni.ino = ino;
@@ -1658,6 +1651,7 @@ int recover_inode_page(struct f2fs_sb_info *sbi, struct page *page)
 		WARN_ON(1);
 	set_node_addr(sbi, &new_ni, NEW_ADDR, false);
 	inc_valid_inode_count(sbi);
+	set_page_dirty(ipage);
 	f2fs_put_page(ipage, 1);
 	return 0;
 }
@@ -1966,7 +1960,7 @@ static int init_node_manager(struct f2fs_sb_info *sbi)
 	nm_i->max_nid = NAT_ENTRY_PER_BLOCK * nat_blocks;
 
 	/* not used nids: 0, node, meta, (and root counted as valid node) */
-	nm_i->available_nids = nm_i->max_nid - 3;
+	nm_i->available_nids = nm_i->max_nid - F2FS_RESERVED_NODE_NUM;
 	nm_i->fcnt = 0;
 	nm_i->nat_cnt = 0;
 	nm_i->ram_thresh = DEF_RAM_THRESHOLD;
